@@ -1,0 +1,188 @@
+### InnoDB中的B+树
+
+##### 学习目标
+
+- 掌握B+树的并发访问方式
+- 掌握记录的增删查改对B+树的访问
+- 掌握树结构变更的细节
+
+#### B+树的并发访问方式
+
+innodb中对B+树的并发控制的逻辑在`btr_cur_search_to_nth_level()`函数中。下面通过阅读该函数来分析具体的并发控制方式。
+
+对于`btr_cur_search_to_nth_level()`函数来说，有以下几种加锁方式，我们将逐个分析在某种加锁方式下，B+树的并发访问控制方式。
+
+``` c++
+enum btr_latch_mode {
+ 	/** Search a record on a leaf page and S-latch it. */
+	BTR_SEARCH_LEAF = RW_S_LATCH,
+	/** (Prepare to) modify a record on a leaf page and X-latch it. */
+	BTR_MODIFY_LEAF	= RW_X_LATCH,
+	/** Obtain no latches. */
+	BTR_NO_LATCHES = RW_NO_LATCH,
+	/** Start modifying the entire B-tree. */
+	BTR_MODIFY_TREE = 33,
+	/** Continue modifying the entire B-tree. */
+	BTR_CONT_MODIFY_TREE = 34,
+	/** Search the previous record. */
+	BTR_SEARCH_PREV = 35,
+	/** Modify the previous record. */
+	BTR_MODIFY_PREV = 36,
+	/** Start searching the entire B-tree. */
+	BTR_SEARCH_TREE = 37,
+	/** Continue searching the entire B-tree. */
+	BTR_CONT_SEARCH_TREE = 38 
+}
+```
+
+##### BTR_SEARCH_LEAF=RW_S_LATCH
+
+这种加锁方式用来读取数据页上的一条记录。当定位到叶子节点时，会对叶子节点加S锁。当`latch_mode=BTR_SEARCH_LEAF`时，`btr_cur_search_to_nth_level()`函数的流程如下：
+
+``` c++
+btr_cur_search_to_nth_level(mtr,latch_mode) {
+    //记录下搜索开始前mtr锁栈的位置，因为定位到叶子节点时需要释放检索B+树过程中申请的锁。
+    int savepoint = mtr_set_savepoint(mtr);
+    //获取索引的S-latch
+    mtr_s_lock(dict_index_get_lock(index), mtr);
+    //设置对中间节点的加锁方式，一律加S-latch
+    int upper_rw_latch = RW_S_LATCH;
+    //如果root节点同时是叶节点（只有一层）,则要改变加锁策略
+    //具体来说当是修改操作的时均加X锁，当是读取操作
+    时均加S锁
+    root_leaf_rw_latch=btr_cur_latch_for_root_leaf(latch_mode);
+    int height = ULINT_UNDEFINED;
+    //开始往下搜索
+search_loop:
+    rw_latch = RW_NO_LATCH;
+    if (height != 0) {
+        //如果是中间节点，则加S锁
+        rw_latch = upper_rw_latch;
+    } else {
+        //如果是叶子节点，则加S锁
+        rw_latch = latch_mode;
+    }
+retry_page_get:
+    //对获取的数据页加S锁
+    block = buf_page_get_gen(page_id,rw_latch);
+	//如果是根节点，记录一些高度信息
+    if (UNIV_UNLIKELY(height == ULINT_UNDEFINED)) {
+        height = btr_page_get_level(page, mtr);
+        root_height = height;
+        cursor->tree_height = root_height + 1; 
+    }
+    //如果是叶子节点
+    if(height == 0) {
+        if(!s_latch_by_caller
+          && !srv_read_only_mode
+          && !modify_external) {
+            //0.1 释放索引S锁
+            mtr_release_s_latch_at_savepoint(
+            	mtr, savepoint, dict_index_get_lock(index));
+        }
+        //0.2 释放所持有的锁
+        for (; n_release < n_blocks; n_release++) {
+            mtr_release_block_at_savepoint(mtr, tree_savepoints[n_release],
+                                          tree_blocks[n_release]);
+        }
+        page_mode = mode;	//叶节点的搜索模式采用用户指定的搜索模式
+        //0.3 搜索页面，放置游标
+        page_cur_search_with_match(block, index, tuple, page_mode, &up_match,
+                                  &low_match, page_cursor, need_path? cursor->rtr_info:NULL);
+    }
+   	//如果是中间节点
+    if(level != height) {
+		/* 获取下一层的节点信息 */
+		page_id.reset(
+			space,
+			btr_node_ptr_get_child_page_no(node_ptr, offsets));
+		n_blocks++;
+        goto search_loop;
+    }
+    //最后设置游标信息
+    cursor->low_match = low_match;
+	cursor->low_bytes = low_bytes;
+	cursor->up_match = up_match;
+	cursor->up_bytes = up_bytes;
+}
+```
+
+##### BTR_MODIFY_LEAF = RW_X_LATCH
+
+这种加锁方式用于修改一个叶子节点上的记录，而且修改记录时不会导致树结构改变。在InnoDB里，所有的修改操作都会首先尝试使用`BTR_MODIFY_LEAF`的方式加锁，如果使用此种加锁方式不成功（说明此次修改操作会导致树结构发生改变），则会使用`BTR_MODIFY_TREE`来进行加锁。
+
+`BTR_MODIFY_LEAF`加锁模式下，`btr_cur_search_to_nth_level()`的流程如下所示。
+
+```c++
+btr_cur_search_to_nth_level(mtr, latch_mode) {
+    //记录下此时mtr锁栈的位置，此时mtr还未获取该B+树的任何锁（包括索引锁）
+    savepoint = mtr_set_savepoint(mtr);
+    //对索引加S锁
+    mtr_s_lock(dict_index_get_lock(index), mtr);
+    //设置对中间节点的加锁模式
+    int upper_rw_latch = RW_S_LATCH;
+    //如果根节点是叶节点，则对根节点加X锁
+    int root_leaf_rw_latch = btr_cur_latch_for_root_leaf(latch_mode);
+    int height = ULINT_UNDEFINED;
+    //向下搜索循环
+search_loop:
+    int rw_latch = RW_NO_LATCH;
+    if (height != 0) {
+        if(modify_external
+          && height == ULINT_UNDEFINED
+          && upper_rw_latch == RW_S_LATCH) {
+            //如果本次修改涉及到外部存储字段的修改，且访问的是根节点，则加SX锁
+            rw_latch = RW_SX_LATCH;
+        } else {
+            //如果只是中间节点，则加S锁
+            rw_latch = upper_rw_latch;
+        }
+    } else {
+        //如果是叶子节点，则改加X锁
+        rw_latch = latch_mode;
+    }
+retry_page_get:
+    //以rw_latch指定的锁模式加锁
+    buf_page_get_gen(page_id, rw_latch);
+    //获取树高，设置cursor的某些成员
+    if (height == ULINT_UNDEFINED) {
+        height = btr_page_get_level(page, mtr);
+        root_height = height;
+        cursor->tree_height = root_height+1;
+    }
+    //如果搜索到叶子节点
+    if (height == 0) {
+        //释放索引的S锁
+        mtr_release_s_latch_at_savepoint(mtr, savepoint,
+                                        dict_index_get_lock(index));
+		//释放已获取的中间节点的锁
+        for(; n_release<n_blocks; n_release++) {
+            mtr_release_block_at_savepoint(
+            	mtr, tree_savepoint[n_release],
+            	tree_block[n_release]);
+        }
+        page_mode = mode;
+    }
+    //搜索页上的记录（中间节点）
+    if (height != 0) {
+    	page_cur_search_with_match_bytes(
+        	block, index, tuple, page_mode, &up_match, &low_match, page_cursor);
+    }
+    //如果是中间节点或没到目的层，则获取叶子节点的页号
+    if (level != height) {
+        //获取指向子节点的指针
+        node_ptr = page_cur_get_rec(page_cursor);
+        offsets = rec_get_offsets(
+            node_ptr, index, offsets, ULINT_UNDEFINED, &heap);
+        //转到子节点
+        page_id.reset(space, btr_node_ptr_get_child_page_no(node_ptr, offsets));
+        n_blocks++;
+    }
+    //最后设置游标信息
+	cursor->low_match = low_match;
+	cursor->low_bytes = low_bytes;
+	cursor->up_match = up_match;
+	cursor->up_bytes = up_bytes;    
+}
+```
+
