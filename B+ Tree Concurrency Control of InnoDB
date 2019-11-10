@@ -185,4 +185,49 @@ retry_page_get:
 	cursor->up_bytes = up_bytes;    
 }
 ```
+##### BTR_MODIFY_TREE
 
+这种加锁方式用于修改树的结构。当一个修改操作使用`BTR_MODIFY_LEAF`加锁方式（乐观更新）发现不成功时，会采用`BTR_MODIFY_TREE`这种方式，也就是要进行悲观更新。`InnoDB`这部分的代码在`5.7`之后发生了较大的变化，里面杂糅了多个B+树并发控制的思想。在`MySQL 5.6`中，如果要进行树结构变更，会首先对索引加`RW_X_LATCH`将整个树锁住。而在`MySQL 5.7`中，在进行树结构变更时，可以只锁住要修改的分支，这样就可以降低B+树读写线程的冲突。
+
+在`BTR_MODIFY_TREE`的加锁模式下，`btr_cur_search_to_nth_level()`函数的执行流程如下所示：
+
+``` c++
+btr_cur_search_to_nth_level(mtr, latch_mode) {
+    //获取mtr锁栈的位置，此时线程还未获取任何B+树相关的锁(包括index锁)
+    savepoint = mtr_set_savepoint(mtr);
+    /*这里有个判断，如果purge任务比较重，则会对树加RW_X_LATCH来对整个B+树加锁，
+      主要防止其他线程再进行读写。如果purge任务不重，则走正常的加锁逻辑，即对索引
+      加RW_SX_LATCH，这时其他线程可以再不与此线程发生冲突的情况下读写。*/
+    if (lock_intention == BTR_INTENTION_DELETE
+		&& trx_sys->rseg_history_len > BTR_CUR_FINE_HISTORY_LENGTH
+		&& buf_get_n_pending_read_ios()) {
+        mtr_x_lock(dict_index_get_lock(index), mtr);
+    } else {
+        mtr_sx_lock(dict_index_get_lock(index), mtr);
+    }
+    //对中间节点加RW_X_LATCH锁
+    upper_rw_latch = RW_X_LATCH;
+    //如果是根节点，则对根节点加RW_X_LATCH锁
+    root_leaf_rw_latch = btr_cur_latch_for_root_leaf(latch_mode);
+    height = ULINT_UNDEFINED;
+search_loop:
+	rw_latch = RW_NO_LATCH;   
+retry_page_get:
+    //以rw_latch指定的锁模式加锁
+    buf_page_get_gen(page_id, rw_latch);
+    //如果是根节点，则记录树高
+    if (height == ULINT_UNDEFINED) {
+        height = btr_page_get_level(page, mtr);
+        root_height = height;
+    }
+    //如果是叶子节点，则会锁住目标节点及其左右兄弟节点
+    if (height == 0) {
+        if (rw_latch == RW_NO_LATCH) {
+            /* btr_cur_latch_leaves函数会自左向右地对目标叶子节点及其左右
+            兄弟节点加RW_X_LATCH锁。*/
+            latch_leaves = btr_cur_latch_leaves();
+        }
+    }
+    
+}
+```
