@@ -37,7 +37,7 @@ enum btr_latch_mode {
 
 ##### BTR_SEARCH_LEAF=RW_S_LATCH
 
-这种加锁方式用来读取数据页上的一条记录。当定位到叶子节点时，会对叶子节点加S锁。当`latch_mode=BTR_SEARCH_LEAF`时，`btr_cur_search_to_nth_level()`函数的流程如下：
+​		这种加锁方式用来读取数据页上的一条记录。当定位到叶子节点时，会对叶子节点加S锁。当`latch_mode=BTR_SEARCH_LEAF`时，`btr_cur_search_to_nth_level()`函数的流程如下：
 
 ``` c++
 btr_cur_search_to_nth_level(mtr,latch_mode) {
@@ -109,7 +109,7 @@ retry_page_get:
 
 ##### BTR_MODIFY_LEAF = RW_X_LATCH
 
-这种加锁方式用于修改一个叶子节点上的记录，而且修改记录时不会导致树结构改变。在InnoDB里，所有的修改操作都会首先尝试使用`BTR_MODIFY_LEAF`的方式加锁，如果使用此种加锁方式不成功（说明此次修改操作会导致树结构发生改变），则会使用`BTR_MODIFY_TREE`来进行加锁。
+​		这种加锁方式用于修改一个叶子节点上的记录，而且修改记录时不会导致树结构改变。在InnoDB里，所有的**修改操作**都会首先尝试使用`BTR_MODIFY_LEAF`的方式加锁，如果使用此种加锁方式不成功（说明此次修改操作会导致树结构发生改变），则会使用`BTR_MODIFY_TREE`来进行加锁。
 
 `BTR_MODIFY_LEAF`加锁模式下，`btr_cur_search_to_nth_level()`的流程如下所示。
 
@@ -185,9 +185,10 @@ retry_page_get:
 	cursor->up_bytes = up_bytes;    
 }
 ```
+
 ##### BTR_MODIFY_TREE
 
-这种加锁方式用于修改树的结构。当一个修改操作使用`BTR_MODIFY_LEAF`加锁方式（乐观更新）发现不成功时，会采用`BTR_MODIFY_TREE`这种方式，也就是要进行悲观更新。`InnoDB`这部分的代码在`5.7`之后发生了较大的变化，里面杂糅了多个B+树并发控制的思想。在`MySQL 5.6`中，如果要进行树结构变更，会首先对索引加`RW_X_LATCH`将整个树锁住。而在`MySQL 5.7`中，在进行树结构变更时，可以只锁住要修改的分支，这样就可以降低B+树读写线程的冲突。
+​		这种加锁方式用于修改树的结构。当一个修改操作使用`BTR_MODIFY_LEAF`加锁方式（乐观更新）发现不成功时，会采用`BTR_MODIFY_TREE`这种方式，也就是要进行悲观更新。`InnoDB`这部分的代码在`5.7`之后发生了较大的变化，里面杂糅了多个B+树并发控制的思想。在`MySQL 5.6`中，如果要进行树结构变更，会首先对索引加`RW_X_LATCH`将整个树锁住。而在`MySQL 5.7`中，在进行树结构变更时，可以只锁住要修改的分支，这样就可以降低B+树读写线程的冲突。
 
 在`BTR_MODIFY_TREE`的加锁模式下，`btr_cur_search_to_nth_level()`函数的执行流程如下所示：
 
@@ -211,6 +212,8 @@ btr_cur_search_to_nth_level(mtr, latch_mode) {
     root_leaf_rw_latch = btr_cur_latch_for_root_leaf(latch_mode);
     height = ULINT_UNDEFINED;
 search_loop:
+    /* 对所有节点（根节点除外）的默认加锁方式，即对于BTR_MODIFY_TREE
+    的加锁方式，所有中间节点都会首先加`RW_NO_LATCH`锁。*/
 	rw_latch = RW_NO_LATCH;   
 retry_page_get:
     //以rw_latch指定的锁模式加锁
@@ -228,6 +231,152 @@ retry_page_get:
             latch_leaves = btr_cur_latch_leaves();
         }
     }
-    
+    //根据搜索条件，检索节点
+    page_cur_search_with_match();
+    /* 检测本次修改是否对会造成当前页面的悲观更新，如果不会，则释放从根节点到
+    本节点之间的所有节点的LATCH（即root节点和本节点的LATCH仍然持有）。*/
+    if (!btr_cur_will_modify_tree(current_page, node_ptr_max_size)) {
+        	/* we can release upper blocks */
+			for (; n_releases < n_blocks; n_releases++) {
+				if (n_releases == 0) {
+					/* 不能释放根节点的锁 */
+					continue;
+				}
+
+				/* 释放上层节点。 */
+				mtr_release_block_at_savepoint(
+					mtr, tree_savepoints[n_releases],
+					tree_blocks[n_releases]);
+			}
+    }
+    /* 如果到达目标层，则对锁栈内未释放的数据页（RW_NO_LATHC）加RW_X_LATCH锁，
+    结合上个if的操作，可知，用户线程只锁住了可能修改的分支上的数据页。*/
+    if (height == level
+		&& latch_mode == BTR_MODIFY_TREE) {
+		ut_ad(upper_rw_latch == RW_X_LATCH);
+		/* 对未释放的分支加X-LATCH. */
+		for (ulint i = n_releases; i <= n_blocks; i++) {
+			mtr_block_x_latch_at_savepoint(
+				mtr, tree_savepoints[i],
+				tree_blocks[i]);
+		}
+	}
+	if (level != height) {
+        goto search_loop;
+    } else if (latch_mode == BTR_MODIFY_TREE
+              && lock_intention == BTR_INTENTION_INSERT
+              && mach_read_from_4(page + FIL_PAGE_NEXT) != FIL_NULL
+              && page_rec_is_last(page_cur_get_rec(page_cursor), page)) {
+        /* 这个if是为了处理btr_insert_into_right_sibling()函数可能导致父节点上记录的删除。*/
+        
+        if(height == 0) {
+			/* 释放叶子节点的锁。 */
+			for (uint i = 0; i < 3; i++) {
+				if (latch_leaves.blocks[i] != NULL) {
+					mtr_release_block_at_savepoint(
+						mtr, latch_leaves.savepoints[i],
+						latch_leaves.blocks[i]);
+					latch_leaves.blocks[i] = NULL;
+				}
+			}            
+        }
+        //这时需要重新检索B+树
+        goto need_opposite_intention;
+    }
 }
 ```
+
+​		上面可以看到B+树变更时，逻辑比较复杂。这里有几点需要提一下。上面函数调用了`btr_cur_need_oppsote_intention()`函数，该函数用于判断是否需要进行与本次要执行操作相关的操作。举个例子，如果我们要删除一个记录，而该记录是节点的最后一条记录或第一条记录，则会导致父节点因此而插入一条记录，如果我们要插入一个记录，且该记录会插到该节点的最后的位置，则因为可能插入到右兄弟节点，进而导致右兄弟节点的父节点上的记录删除。这种插入和修改操作，代码中用`btr_intention_t`类型来表示这几种情况：
+
+``` c++
+/* 1.为了简化代码，btr_intention_t变量的值与BTR_LATCH_FOR_INSERT和
+BTR_LATCH_FOR_DELETE两种锁类型相关，并且在检索B+树时存入latch_mode
+变量中。
+   2.对于B+树操作只有删除和插入操作，更新操作是通过先删除后插入来实现的。
+*/
+enum btr_intention_t{
+	BTR_INTENTION_DELETE,	//需要删除一条记录时设置，BTR_LATCH_FOR_DELETE。
+	BTR_INTENTION_BOTH,
+	BTR_INTENTION_INSERT	//需要插入一条记录时设置，BTR_LATCH_FOR_INSERT
+}
+```
+
+##### BTR_SEARCH_LEAF && BTR_MODIFY_LEAF
+
+​		这两种加锁方式用于向前查找记录，这是个比较奇怪的操作，因为在`InnoDB`中，记录都是按照字母表的顺序在B+树的叶子节点上自左向右存放的，我们一般情况下只会从左向右查找（不妨称为默认的访问方式）。向前查找如果不进行特别的并发控制会与默认的访问方式造成冲突，因为默认的访问是自左向右加锁的，如果前向查找会造成锁冲突。我们下面会看一下什么情况下会使用前向搜索，以及在前向搜索的情况下，B+树的加锁方式。
+
+​		首先看一下当加锁方式为`BTR_SEARCH_LEAF`或`BTR_MODIFY_LEAF`时`btr_cur_search_to_nth_level()`函数的执行流程：
+
+``` c++
+btr_cur_search_to_nth_level(mtr, latch_mode) {
+    //0. 已经检索的节点数
+    n_blocks = 0;
+    //0. 已经释放锁的节点数
+    n_release = 0;
+    //1. 获取检索开始时锁栈的位置，在检索结束时需要释放获取的锁
+    savepoint = mtr_set_savepoint(mtr);
+    //2. 对索引加S-LATCH
+    mtr_s_lock(dict_index_get_lock(index), mtr);
+    //3. 设置中间节点的加锁方式为S-LATCH
+    upper_rw_latch = RW_S_LATCH;
+    /*4. 如果root节点是叶子节点，则改变对root的加锁方式: 
+    BTR_SEARCH_PREV 则加 RW_S_LATCH,
+    BTR_MODIFY_PREV 则加 RW_X_LATCH。 */
+    root_leaf_rw_latch = btr_cur_latch_for_root_leaf(latch_mode);
+    height = ULINT_UNDEFINED;
+search_loop:
+    buf_mode = BUF_GET;
+    rw_latch = RW_NO_LATCH;	//rw_latch是获取数据页的加锁方式
+    
+    /* 5. 如果是中间节点且是第一次检索，则设置加锁方式为`RW_S_LATCH`。 */
+    if (height != 0) {
+        if (!retrying_for_search_prev) {
+        	rw_latch = upper_rw_latch;
+        }
+    } else {
+        //5.1 如果是叶子节点或是第二次检索，则不加锁
+        rw_latch = RW_NO_LATCH;
+    }
+retry_page_get:
+    //记录每个块的锁在mtr锁栈中的位置
+    tree_savepoints[n_blocks] = mtr_set_savepoint(mtr);
+	block = buf_page_get_gen(page_id, rw_latch, buf_mode);
+    tree_blocks[n_blocks] = block;
+    //6. 如果是root节点，则记录树高信息
+    if (height == ULINT_UNDEFINED) {
+        height = btr_page_get_level(page, mtr);
+        root_height = height;
+    }
+    //7. 如果已经定位到叶子节点，则释放上层节点。
+    if (height == 0) {
+		for (; n_releases < n_blocks; n_releases++) {
+			mtr_release_block_at_savepoint(
+				mtr, tree_savepoints[n_releases],
+				tree_blocks[n_releases]);
+		}
+    }
+    //8. 如果是中间节点
+    if (level != height) {
+        if ((latch_mode == BTR_SEARCH_PREV
+            || latch_mode == BTR_MODIFY_PREV)
+           && !retrying_for_search_prev) {
+            /* 如果有前驱节点，且记录是当前页最左的记录：*/
+            if (btr_page_get_prev(page, mtr) != FIL_NULL
+               && page_rec_is_first(node_ptr, page)) {
+                if (leftmost_from_level == 0) {
+                    leftmost_from_level = height + 1;
+                }
+            } else {
+                leftmost_from_level = 0;
+            }
+            /* 如果是叶子节点并且leftmost_from_level > 0，则需要重新进行检索。*/
+            if (height == 0 && leftmost_from_level > 0) {
+                //设置重新检索标志
+                retrying_for_search_prev = true;
+                
+            }
+        }
+    }
+}
+```
+
